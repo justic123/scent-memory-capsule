@@ -37,14 +37,76 @@ export default function App() {
     }, 3000);
   };
 
-  const mockVLModelAPI = () => {
-    return new Promise((resolve) => {
-      const delay = 1500 + Math.random() * 2000;
-      setTimeout(() => {
-        const randomResult = MOCK_VL_RESPONSES[Math.floor(Math.random() * MOCK_VL_RESPONSES.length)];
-        resolve(randomResult);
-      }, delay);
-    });
+// ✅ 粘贴这段真实 API 调用代码
+  // --- 真实的豆包 VL 模型 API 调用 ---
+  const callDoubaoAPI = async (base64ImageUrl) => {
+    // ⚠️ 请在这里填入你新生成的 API Key
+    const API_KEY = "f4531619-4c26-468e-9056-cf38c4b57abd"; 
+    
+    const promptText = `你是一个专业的场景氛围与香气分析专家。请分析这张图片，提取3-5个场景语义标签，并从以下4个香气大类中选择最匹配的一个：LAVENDER（薰衣草/安静/助眠）、CITRUS（柑橘/活力/清新/阳光）、COFFEE（咖啡/温暖/醇厚/阴天）、SPACE（金属外太空/科幻/冰冷/赛博朋克）。
+请严格以JSON格式输出，不要包含任何其他解释文字。格式必须完全如下：
+{"semantics": ["标签1", "标签2", "标签3"], "scent": "LAVENDER"}`;
+
+    // 【修改点 1 & 2】使用标准的 messages 和 image_url 嵌套格式
+    const requestBody = {
+      "model": "ep-20260408151654-qw7h7",
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": promptText
+            },
+            {
+              "type": "image_url",
+              "image_url": {
+                // FileReader 提取的 base64ImageUrl 已经自带了 data:image/jpeg;base64, 前缀，符合 API 要求
+                "url": base64ImageUrl 
+              }
+            }
+          ]
+        }
+      ]
+    };
+
+    try {
+      // 【修改点 3】将请求路径改为标准的 /api/v3/chat/completions
+      const response = await fetch("/api/v3/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(requestBody)
+      });
+
+      if (!response.ok) {
+        // 增加详细的错误日志打印，如果再失败可以看浏览器的控制台 (F12) 查明具体原因
+        const errorData = await response.text();
+        console.error("API 报错详细信息:", errorData);
+        throw new Error(`API 请求失败: ${response.status}`);
+      }
+
+      const data = await response.json();
+      
+      // 【修改点 4】解析标准格式的数据返回路径 (data.choices[0].message.content)
+      let resultText = data.choices[0].message.content || "";
+      
+      // 清理大模型可能自带的 markdown 代码块标记
+      resultText = resultText.replace(/```json/g, '').replace(/```/g, '').trim();
+      
+      const resultJson = JSON.parse(resultText);
+
+      return {
+        semantics: resultJson.semantics || ["未知场景"],
+        scent: resultJson.scent || "CITRUS" 
+      };
+
+    } catch (error) {
+      console.error("调用火山引擎 API 出错:", error);
+      throw error;
+    }
   };
 
   const processNewImage = async (imageUrl, fileName) => {
@@ -62,10 +124,9 @@ export default function App() {
     };
     
     setPhotos(prev => [newPhoto, ...prev]);
-
-    // 2. 模拟 API 调用
+    // 2. 调用真实的 API
     try {
-      const vlResult = await mockVLModelAPI();
+      const vlResult = await callDoubaoAPI(imageUrl); 
       
       // 3. 更新为完成状态
       setPhotos(prev => prev.map(p => {
