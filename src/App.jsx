@@ -12,21 +12,76 @@ const SCENT_CATEGORIES = {
   'SPACE': { id: 'space', name: '金属外太空', color: 'bg-cyan-500', icon: Rocket, colorCode: '#06b6d4', shadow: 'shadow-cyan-500/50' }
 };
 
+// 定义 UUID（必须与 ESP32 代码中一致）
+const SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+const CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+
+// 用于缓存蓝牙连接的全局变量
+let bleCharacteristic = null; 
+
 export default function App() {
+  // ✅ 所有的状态 (useState) 必须放在组件内部
   const [photos, setPhotos] = useState([]);
   const [toasts, setToasts] = useState([]);
   const [exifData, setExifData] = useState(null);
+  const [isBleConnected, setIsBleConnected] = useState(false); // 蓝牙连接状态
   const fileInputRef = useRef(null);
 
+  // 提示框函数
   const showToast = (message, type = 'info') => {
     const id = Date.now();
     setToasts(prev => [...prev, { id, message, type }]);
     setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 3000);
   };
 
+  // ✅ 专门的蓝牙连接函数（放到组件内部，因为要使用 setIsBleConnected 和 showToast）
+  const connectBluetooth = async () => {
+    try {
+      const device = await navigator.bluetooth.requestDevice({
+        filters: [{ name: 'ESP32_Scent_Capsule' }],
+        optionalServices: [SERVICE_UUID]
+      });
+      const server = await device.gatt.connect();
+      const service = await server.getPrimaryService(SERVICE_UUID);
+      bleCharacteristic = await service.getCharacteristic(CHARACTERISTIC_UUID);
+      
+      setIsBleConnected(true);
+      showToast('硬件连接成功！', 'success');
+      
+      // 监听断开连接
+      device.addEventListener('gattserverdisconnected', () => {
+        bleCharacteristic = null;
+        setIsBleConnected(false);
+        showToast('蓝牙已断开', 'error');
+      });
+    } catch (err) {
+      console.error('蓝牙连接失败:', err);
+      showToast('蓝牙连接取消或失败', 'error');
+    }
+  };
+
+  // ✅ 发送命令给 ESP32 的函数
+  const sendToESP32 = async (scent) => {
+    if (!bleCharacteristic) {
+      console.warn('蓝牙未连接，跳过发送');
+      showToast('请先连接蓝牙胶囊', 'error');
+      return false;
+    }
+
+    try {
+      const encoder = new TextEncoder();
+      // 发送气味大类标识，例如 "LAVENDER"
+      await bleCharacteristic.writeValue(encoder.encode(scent));
+      console.log('蓝牙发送成功:', scent);
+      return true;
+    } catch (err) {
+      console.error('蓝牙通信失败:', err);
+      return false;
+    }
+  };
+
   // ⚠️ 核心新增：监听来自 Node.js 的实时广播
   useEffect(() => {
-    // 如果网页运行在电脑以外的设备，记得改 IP
     const eventSource = new EventSource('http://localhost:8080/api/stream');
 
     eventSource.onmessage = (event) => {
@@ -34,20 +89,17 @@ export default function App() {
       if (data.event === 'new_photo_from_camera') {
         console.log("📸 监听到硬件相机传来了新照片！", data);
         showToast("检测到相机新照片，开始分析...", 'info');
-        
-        // 收到硬件图片后，直接走第二步分析流程
         handleIncomingHardwarePhoto(data.filename, data.imageUrl, data.originalName);
       }
     };
 
-    return () => eventSource.close(); // 组件卸载时关闭连接
+    return () => eventSource.close(); 
   }, []);
 
   // 专门处理从硬件（或后台广播）传来的图片
   const handleIncomingHardwarePhoto = async (savedFilename, imageUrl, originalName) => {
     const photoId = 'img_' + Date.now();
     
-    // 图片立刻上屏展示
     const newPhoto = {
       id: photoId,
       url: imageUrl, 
@@ -60,7 +112,6 @@ export default function App() {
     setPhotos(prev => [newPhoto, ...prev]);
 
     try {
-      // 网页主动命令 Node.js 去调用大模型分析
       const analyzeResponse = await fetch("http://localhost:8080/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -75,6 +126,9 @@ export default function App() {
           p.id === photoId ? { ...p, status: 'complete', semantics: vlResult.semantics, scentKey: vlResult.scent } : p
         ));
         showToast(`硬件照片解析完成:【${SCENT_CATEGORIES[vlResult.scent].name}】`, 'success');
+        
+        // ✅ 自动下发控制指令！
+        sendToESP32(vlResult.scent);
       } else {
          throw new Error("大模型分析失败");
       }
@@ -111,14 +165,6 @@ export default function App() {
       const uploadData = await uploadResponse.json();
 
       if (!uploadData.success) throw new Error("图片保存失败");
-
-      // ⚠️ 这里有一个小细节：网页端主动上传图片，Node 也会广播。
-      // 为了防止网页“自己上传的图片，又因为听到广播而重复分析一遍”，
-      // 我们实际上可以把 analyze 的请求留给广播处理，或者在网页端做个去重过滤。
-      // 但现在我们直接把网页上传的分析也扔给 handleIncomingHardwarePhoto 处理，保持统一！
-      
-      // 意思是：我们传完就不用管了，Node 会广播，网页监听到广播会自动去展示和分析！
-      // 为了不让本网页卡顿，先把之前放进去的占位图删掉，等待广播送来真实的图
       setPhotos(prev => prev.filter(p => p.id !== photoId));
 
     } catch (error) {
@@ -153,16 +199,24 @@ export default function App() {
     }
   };
 
-  const triggerScentDevice = (photo, event) => {
+  // ✅ 手动点击触发香气
+  const triggerScentDevice = async (photo, event) => {
     if (!photo || !photo.scentKey) return;
     const scentInfo = SCENT_CATEGORIES[photo.scentKey];
-    console.log(`[HARDWARE SIGNAL] COMMAND: EMIT_SCENT | CODE: ${scentInfo.id} | DURATION: 5s`);
-    showToast(`正在给硬件发送信号...释放【${scentInfo.name}】`, 'info');
+    
+    showToast(`正在发送信号...释放【${scentInfo.name}】`, 'info');
 
-    const btn = event.currentTarget;
-    const rect = btn.getBoundingClientRect();
-    for(let i=0; i<5; i++) {
-      createParticle(rect.left + rect.width/2, rect.top, scentInfo.colorCode);
+    // 调用发送函数
+    const success = await sendToESP32(photo.scentKey);
+    
+    if (success) {
+      // 发送成功后才播放粒子动画
+      const btn = event.currentTarget;
+      const rect = btn.getBoundingClientRect();
+      for(let i=0; i<5; i++) {
+        createParticle(rect.left + rect.width/2, rect.top, scentInfo.colorCode);
+      }
+      showToast(`ESP32 已接收指令！`, 'success');
     }
   };
 
@@ -215,8 +269,20 @@ export default function App() {
             <p className="text-sm" style={{ color: 'var(--insta-text-minor)' }}>核心主力模式：完美适配运动相机使用场景。用户按快门，系统全自动完成解析、标记与香气控制，零学习成本。</p>
           </div>
           <div className="flex flex-col sm:flex-row gap-5 w-full justify-center items-center z-10">
+            
+            {/* ✅ 蓝牙连接按钮 */}
+            <button 
+              onClick={connectBluetooth} 
+              className={`w-full sm:w-auto flex items-center justify-center gap-2 border px-6 py-4 rounded-xl transition-all ${isBleConnected ? 'border-green-500 text-green-500' : 'border-[var(--insta-tech-blue)] text-[var(--insta-tech-blue)] hover:bg-blue-50'}`}
+            >
+              <Zap className="w-5 h-5" />
+              <span className="text-sm font-medium">
+                {isBleConnected ? 'ESP32 已连接' : '1. 连接蓝牙胶囊'}
+              </span>
+            </button>
+
             <button onClick={simulateCameraCapture} className="btn-primary w-full sm:w-auto flex items-center justify-center gap-3 font-bold px-10 py-4 rounded-xl text-lg">
-              <Camera className="w-6 h-6" /><span>按下快门 (实时生成香气)</span>
+              <Camera className="w-6 h-6" /><span>2. 按下快门 (实时生成香气)</span>
             </button>
             <input type="file" ref={fileInputRef} onChange={handleFileUpload} accept="image/*" multiple className="hidden" />
             <button onClick={() => fileInputRef.current?.click()} className="w-full sm:w-auto flex items-center justify-center gap-2 bg-transparent border px-6 py-4 rounded-xl transition-all hover:text-[var(--insta-text-primary)]" style={{ borderColor: 'var(--insta-border-dark)', color: 'var(--insta-text-minor)' }}>
